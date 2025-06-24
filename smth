@@ -1,0 +1,339 @@
+Sub CreateJiraTicket()
+    ' Jira Create Ticket Macro
+    ' This macro creates a new Jira ticket using summary and description from Excel cells
+    
+    ' Configuration variables - MODIFY THESE FOR YOUR SETUP
+    Dim jiraBaseURL As String
+    Dim authToken As String
+    Dim projectKey As String
+    Dim issueType As String
+    Dim targetWorksheet As String
+    
+    ' CONFIGURATION SECTION - MODIFY THESE VALUES
+    jiraBaseURL = "https://your-domain.atlassian.net"  ' Replace with your Jira URL
+    authToken = "TOKEN"  ' Replace with your actual token
+    projectKey = "PROJ"  ' Replace with your project key
+    issueType = "Task"  ' Issue type: Task, Bug, Story, etc.
+    targetWorksheet = "Sheet1"  ' Worksheet containing the ticket data
+    
+    ' Cell references for ticket data - MODIFY THESE FOR YOUR LAYOUT
+    Dim summaryCell As String
+    Dim descriptionCell As String
+    summaryCell = "B2"  ' Cell containing the ticket summary
+    descriptionCell = "B3"  ' Cell containing the ticket description
+    
+    ' Get the worksheet
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(targetWorksheet)
+    
+    ' Read values from Excel
+    Dim summary As String
+    Dim description As String
+    summary = Trim(ws.Range(summaryCell).Value)
+    description = Trim(ws.Range(descriptionCell).Value)
+    
+    ' Validate required fields
+    If summary = "" Then
+        MsgBox "Error: Summary cannot be empty. Please enter a summary in cell " & summaryCell
+        Exit Sub
+    End If
+    
+    ' Create HTTP request object
+    Dim http As Object
+    Set http = CreateObject("MSXML2.XMLHTTP")
+    
+    ' Build the API URL
+    Dim apiURL As String
+    apiURL = jiraBaseURL & "/rest/api/2/issue"
+    
+    ' Build JSON payload
+    Dim jsonPayload As String
+    jsonPayload = BuildCreateIssueJSON(projectKey, issueType, summary, description)
+    
+    ' Configure the request
+    http.Open "POST", apiURL, False
+    http.setRequestHeader "Authorization", "Bearer " & authToken
+    http.setRequestHeader "Content-Type", "application/json"
+    http.setRequestHeader "Accept", "application/json"
+    
+    ' Send the request
+    On Error GoTo ErrorHandler
+    http.send jsonPayload
+    
+    ' Check response
+    If http.Status = 201 Then
+        ' Success - parse the response to get the new ticket key
+        Dim responseText As String
+        responseText = http.responseText
+        
+        Dim ticketKey As String
+        ticketKey = ExtractTicketKey(responseText)
+        
+        ' Update Excel with the created ticket information
+        ws.Range("A2").Value = "Summary:"
+        ws.Range("A3").Value = "Description:"
+        ws.Range("A4").Value = "Created Ticket:"
+        ws.Range("B4").Value = ticketKey
+        ws.Range("A5").Value = "Ticket URL:"
+        ws.Range("B5").Value = jiraBaseURL & "/browse/" & ticketKey
+        
+        ' Make the ticket key a clickable hyperlink
+        ws.Hyperlinks.Add Anchor:=ws.Range("B5"), Address:=jiraBaseURL & "/browse/" & ticketKey
+        
+        MsgBox "Ticket created successfully!" & vbCrLf & "Ticket Key: " & ticketKey
+    Else
+        ' Error occurred
+        MsgBox "Error creating ticket:" & vbCrLf & "HTTP " & http.Status & " - " & http.statusText & vbCrLf & vbCrLf & "Response: " & http.responseText
+    End If
+    
+    Exit Sub
+    
+ErrorHandler:
+    MsgBox "An error occurred: " & Err.Description & vbCrLf & "Error Number: " & Err.Number
+End Sub
+
+' Function to build the JSON payload for creating an issue
+Function BuildCreateIssueJSON(projectKey As String, issueType As String, summary As String, description As String) As String
+    Dim json As String
+    
+    ' Escape special characters in summary and description
+    summary = EscapeJSON(summary)
+    description = EscapeJSON(description)
+    
+    json = "{" & vbCrLf
+    json = json & "  ""fields"": {" & vbCrLf
+    json = json & "    ""project"": {" & vbCrLf
+    json = json & "      ""key"": """ & projectKey & """" & vbCrLf
+    json = json & "    }," & vbCrLf
+    json = json & "    ""issuetype"": {" & vbCrLf
+    json = json & "      ""name"": """ & issueType & """" & vbCrLf
+    json = json & "    }," & vbCrLf
+    json = json & "    ""summary"": """ & summary & """," & vbCrLf
+    json = json & "    ""description"": """ & description & """" & vbCrLf
+    json = json & "  }" & vbCrLf
+    json = json & "}"
+    
+    BuildCreateIssueJSON = json
+End Function
+
+' Function to escape special characters for JSON
+Function EscapeJSON(text As String) As String
+    Dim result As String
+    result = text
+    
+    ' Replace backslashes first (must be first)
+    result = Replace(result, "\", "\\")
+    ' Replace quotes
+    result = Replace(result, """", "\""")
+    ' Replace newlines
+    result = Replace(result, vbCrLf, "\n")
+    result = Replace(result, vbCr, "\n")
+    result = Replace(result, vbLf, "\n")
+    ' Replace tabs
+    result = Replace(result, vbTab, "\t")
+    
+    EscapeJSON = result
+End Function
+
+' Function to extract ticket key from JSON response
+Function ExtractTicketKey(jsonResponse As String) As String
+    ' Simple extraction of ticket key from JSON response
+    ' Looks for "key":"PROJ-123" pattern
+    
+    Dim keyStart As Integer
+    Dim keyEnd As Integer
+    
+    keyStart = InStr(jsonResponse, """key"":""") + 7
+    If keyStart > 7 Then
+        keyEnd = InStr(keyStart, jsonResponse, """")
+        If keyEnd > keyStart Then
+            ExtractTicketKey = Mid(jsonResponse, keyStart, keyEnd - keyStart)
+        Else
+            ExtractTicketKey = "Unknown"
+        End If
+    Else
+        ExtractTicketKey = "Unknown"
+    End If
+End Function
+
+' Batch ticket creation macro - creates multiple tickets from a range
+Sub CreateMultipleJiraTickets()
+    ' This macro creates multiple tickets from a range of data in Excel
+    
+    ' Configuration
+    Dim jiraBaseURL As String
+    Dim authToken As String
+    Dim projectKey As String
+    Dim issueType As String
+    Dim targetWorksheet As String
+    
+    jiraBaseURL = "https://your-domain.atlassian.net"
+    authToken = "TOKEN"
+    projectKey = "PROJ"
+    issueType = "Task"
+    targetWorksheet = "Sheet1"
+    
+    ' Data range configuration
+    Dim summaryColumn As Integer  ' Column containing summaries
+    Dim descriptionColumn As Integer  ' Column containing descriptions
+    Dim resultColumn As Integer  ' Column to write results
+    Dim startRow As Integer  ' First row of data
+    Dim endRow As Integer  ' Last row of data (0 = auto-detect)
+    
+    summaryColumn = 1  ' Column A
+    descriptionColumn = 2  ' Column B
+    resultColumn = 3  ' Column C
+    startRow = 2  ' Start from row 2 (assuming headers in row 1)
+    endRow = 0  ' Auto-detect last row
+    
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(targetWorksheet)
+    
+    ' Auto-detect last row if not specified
+    If endRow = 0 Then
+        endRow = ws.Cells(ws.Rows.Count, summaryColumn).End(xlUp).Row
+    End If
+    
+    ' Validate range
+    If endRow < startRow Then
+        MsgBox "No data found to process."
+        Exit Sub
+    End If
+    
+    ' Confirm batch operation
+    Dim ticketCount As Integer
+    ticketCount = endRow - startRow + 1
+    
+    If MsgBox("This will create " & ticketCount & " tickets. Continue?", vbYesNo + vbQuestion) <> vbYes Then
+        Exit Sub
+    End If
+    
+    ' Process each row
+    Dim currentRow As Integer
+    Dim successCount As Integer
+    Dim errorCount As Integer
+    
+    successCount = 0
+    errorCount = 0
+    
+    For currentRow = startRow To endRow
+        Dim summary As String
+        Dim description As String
+        
+        summary = Trim(ws.Cells(currentRow, summaryColumn).Value)
+        description = Trim(ws.Cells(currentRow, descriptionColumn).Value)
+        
+        If summary <> "" Then
+            ' Create the ticket
+            Dim ticketKey As String
+            ticketKey = CreateSingleTicket(jiraBaseURL, authToken, projectKey, issueType, summary, description)
+            
+            If ticketKey <> "ERROR" Then
+                ws.Cells(currentRow, resultColumn).Value = ticketKey
+                successCount = successCount + 1
+            Else
+                ws.Cells(currentRow, resultColumn).Value = "ERROR"
+                errorCount = errorCount + 1
+            End If
+        Else
+            ws.Cells(currentRow, resultColumn).Value = "SKIPPED - No Summary"
+        End If
+        
+        ' Update progress
+        Application.StatusBar = "Processing row " & currentRow & " of " & endRow
+    Next currentRow
+    
+    Application.StatusBar = False
+    
+    MsgBox "Batch creation completed!" & vbCrLf & _
+           "Successful: " & successCount & vbCrLf & _
+           "Errors: " & errorCount
+End Sub
+
+' Helper function to create a single ticket (used by batch function)
+Function CreateSingleTicket(jiraURL As String, token As String, projectKey As String, issueType As String, summary As String, description As String) As String
+    On Error GoTo ErrorHandler
+    
+    Dim http As Object
+    Set http = CreateObject("MSXML2.XMLHTTP")
+    
+    Dim apiURL As String
+    apiURL = jiraURL & "/rest/api/2/issue"
+    
+    Dim jsonPayload As String
+    jsonPayload = BuildCreateIssueJSON(projectKey, issueType, summary, description)
+    
+    http.Open "POST", apiURL, False
+    http.setRequestHeader "Authorization", "Bearer " & token
+    http.setRequestHeader "Content-Type", "application/json"
+    
+    http.send jsonPayload
+    
+    If http.Status = 201 Then
+        CreateSingleTicket = ExtractTicketKey(http.responseText)
+    Else
+        CreateSingleTicket = "ERROR"
+    End If
+    
+    Exit Function
+    
+ErrorHandler:
+    CreateSingleTicket = "ERROR"
+End Function
+
+' Setup macro - creates a template in Excel for ticket creation
+Sub SetupTicketCreationTemplate()
+    Dim ws As Worksheet
+    Set ws = ActiveSheet
+    
+    ' Clear existing content
+    ws.Cells.Clear
+    
+    ' Create headers and template
+    ws.Range("A1").Value = "Jira Ticket Creation Template"
+    ws.Range("A1").Font.Bold = True
+    ws.Range("A1").Font.Size = 14
+    
+    ws.Range("A2").Value = "Summary:"
+    ws.Range("A3").Value = "Description:"
+    ws.Range("A4").Value = "Created Ticket:"
+    ws.Range("A5").Value = "Ticket URL:"
+    
+    ' Make labels bold
+    ws.Range("A2:A5").Font.Bold = True
+    
+    ' Add sample data
+    ws.Range("B2").Value = "Sample: Fix login issue"
+    ws.Range("B3").Value = "Sample: Users are unable to log in to the application. Error message appears when clicking login button."
+    
+    ' Format cells
+    ws.Range("B2:B3").Interior.Color = RGB(255, 255, 200)  ' Light yellow background
+    ws.Range("B2:B5").Borders.LineStyle = xlContinuous
+    
+    ' Auto-fit columns
+    ws.Columns("A:B").AutoFit
+    
+    ' Add instructions
+    ws.Range("A7").Value = "Instructions:"
+    ws.Range("A7").Font.Bold = True
+    ws.Range("A8").Value = "1. Replace the sample text in B2 and B3 with your ticket details"
+    ws.Range("A9").Value = "2. Configure the macro settings (Jira URL, token, project key)"
+    ws.Range("A10").Value = "3. Run the CreateJiraTicket macro"
+    
+    ' Add batch creation template
+    ws.Range("A12").Value = "Batch Creation Template:"
+    ws.Range("A12").Font.Bold = True
+    ws.Range("A13").Value = "Summary"
+    ws.Range("B13").Value = "Description"
+    ws.Range("C13").Value = "Result"
+    ws.Range("A13:C13").Font.Bold = True
+    ws.Range("A13:C13").Interior.Color = RGB(200, 200, 200)  ' Gray background
+    
+    ' Add sample batch data
+    ws.Range("A14").Value = "Fix header alignment"
+    ws.Range("B14").Value = "Header is not aligned properly on mobile devices"
+    ws.Range("A15").Value = "Update user manual"
+    ws.Range("B15").Value = "User manual needs to be updated with new features"
+    
+    MsgBox "Template created! You can now modify the configuration in the macro and run CreateJiraTicket or CreateMultipleJiraTickets."
+End Sub
