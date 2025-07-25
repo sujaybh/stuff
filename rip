@@ -1,0 +1,185 @@
+Function GetNextSprintId(boardId As String, bearerToken As String) As String
+    Dim http As Object
+    Dim url As String
+    Dim response As String
+    Dim json As Object
+    Dim sprints As Object
+    Dim sprint As Object
+    Dim sprintName As String
+    Dim sprintId As String
+    Dim startDate As String
+    Dim endDate As String
+    Dim currentDate As Date
+    Dim sprintStartDate As Date
+    Dim sprintEndDate As Date
+    Dim validSprints As Collection
+    Dim validSprint As Object
+    Dim nextSprint As Object
+    Dim minTimeDiff As Double
+    Dim timeDiff As Double
+    Dim i As Integer
+    
+    ' Initialize variables
+    Set validSprints = New Collection
+    currentDate = Now()
+    minTimeDiff = 999999999 ' Large number for comparison
+    
+    ' Create HTTP request object
+    Set http = CreateObject("MSXML2.XMLHTTP")
+    
+    ' Build URL
+    url = "https://horizon.jira2.bankofamerica.com/rest/agile/1.0/board/" & boardId & "/sprint"
+    
+    ' Configure request
+    http.Open "GET", url, False
+    http.setRequestHeader "Authorization", "Bearer " & bearerToken
+    http.setRequestHeader "Content-Type", "application/json"
+    http.setRequestHeader "Accept", "application/json"
+    http.setRequestHeader "X-Atlassian-Token", "no-check"
+    
+    ' Send request
+    On Error GoTo ErrorHandler
+    http.send
+    
+    ' Check if request was successful
+    If http.Status <> 200 Then
+        GetNextSprintId = "Error: HTTP " & http.Status & " - " & http.statusText
+        Exit Function
+    End If
+    
+    ' Parse JSON response
+    response = http.responseText
+    Set json = JsonConverter.ParseJson(response)
+    Set sprints = json("values")
+    
+    ' Loop through sprints and filter valid ones
+    For i = 0 To sprints.Count - 1
+        Set sprint = sprints(i)
+        sprintName = sprint("name")
+        sprintId = CStr(sprint("id"))
+        
+        ' Check if sprint name matches the required format: GFCMA.2025.Qx.Sx (mm/dd mm/dd)
+        If IsValidSprintFormat(sprintName) Then
+            ' Check if sprint has start and end dates
+            If Not IsNull(sprint("startDate")) And Not IsNull(sprint("endDate")) Then
+                startDate = sprint("startDate")
+                endDate = sprint("endDate")
+                
+                ' Parse dates (format: "2025-11-19T12:35:0.00-05:00")
+                sprintStartDate = ParseJiraDate(startDate)
+                sprintEndDate = ParseJiraDate(endDate)
+                
+                ' Create a valid sprint object to store in collection
+                Set validSprint = CreateObject("Scripting.Dictionary")
+                validSprint("id") = sprintId
+                validSprint("name") = sprintName
+                validSprint("startDate") = sprintStartDate
+                validSprint("endDate") = sprintEndDate
+                validSprint("quarter") = GetQuarterFromName(sprintName)
+                validSprint("sprintNum") = GetSprintNumberFromName(sprintName)
+                
+                validSprints.Add validSprint
+            End If
+        End If
+    Next i
+    
+    ' Find the next sprint (closest future start date)
+    For i = 1 To validSprints.Count
+        Set validSprint = validSprints(i)
+        sprintStartDate = validSprint("startDate")
+        
+        ' Check if sprint starts in the future
+        If sprintStartDate > currentDate Then
+            timeDiff = sprintStartDate - currentDate
+            If timeDiff < minTimeDiff Then
+                minTimeDiff = timeDiff
+                Set nextSprint = validSprint
+            End If
+        End If
+    Next i
+    
+    ' Return the ID of the next sprint
+    If Not nextSprint Is Nothing Then
+        GetNextSprintId = nextSprint("id")
+    Else
+        GetNextSprintId = "No future sprint found"
+    End If
+    
+    Exit Function
+    
+ErrorHandler:
+    GetNextSprintId = "Error: " & Err.Description
+End Function
+
+' Helper function to validate sprint name format
+Private Function IsValidSprintFormat(sprintName As String) As Boolean
+    Dim regex As Object
+    Set regex = CreateObject("VBScript.RegExp")
+    
+    ' Pattern: GFCMA.2025.Q[1-4].S[0-9]+ (mm/dd mm/dd)
+    regex.Pattern = "^GFCMA\.2025\.Q[1-4]\.S\d+\s+\(\d{2}/\d{2}\s+\d{2}/\d{2}\)$"
+    regex.IgnoreCase = True
+    
+    IsValidSprintFormat = regex.Test(sprintName)
+End Function
+
+' Helper function to parse Jira date format
+Private Function ParseJiraDate(dateString As String) As Date
+    Dim datePart As String
+    Dim timePart As String
+    Dim dateComponents() As String
+    Dim timeComponents() As String
+    
+    ' Extract date part (before 'T')
+    datePart = Split(dateString, "T")(0)
+    
+    ' Extract time part (after 'T', before timezone)
+    timePart = Split(Split(dateString, "T")(1), "-")(0)
+    If InStr(timePart, "+") > 0 Then
+        timePart = Split(timePart, "+")(0)
+    End If
+    
+    ' Parse date components (YYYY-MM-DD)
+    dateComponents = Split(datePart, "-")
+    
+    ' Parse time components (HH:MM:SS.mmm)
+    timeComponents = Split(Split(timePart, ".")(0), ":")
+    
+    ' Create VBA date
+    ParseJiraDate = DateSerial(CInt(dateComponents(0)), CInt(dateComponents(1)), CInt(dateComponents(2))) + _
+                   TimeSerial(CInt(timeComponents(0)), CInt(timeComponents(1)), CInt(timeComponents(2)))
+End Function
+
+' Helper function to extract quarter number from sprint name
+Private Function GetQuarterFromName(sprintName As String) As Integer
+    Dim regex As Object
+    Dim matches As Object
+    
+    Set regex = CreateObject("VBScript.RegExp")
+    regex.Pattern = "Q(\d)"
+    regex.IgnoreCase = True
+    
+    Set matches = regex.Execute(sprintName)
+    If matches.Count > 0 Then
+        GetQuarterFromName = CInt(matches(0).SubMatches(0))
+    Else
+        GetQuarterFromName = 0
+    End If
+End Function
+
+' Helper function to extract sprint number from sprint name
+Private Function GetSprintNumberFromName(sprintName As String) As Integer
+    Dim regex As Object
+    Dim matches As Object
+    
+    Set regex = CreateObject("VBScript.RegExp")
+    regex.Pattern = "S(\d+)"
+    regex.IgnoreCase = True
+    
+    Set matches = regex.Execute(sprintName)
+    If matches.Count > 0 Then
+        GetSprintNumberFromName = CInt(matches(0).SubMatches(0))
+    Else
+        GetSprintNumberFromName = 0
+    End If
+End Function
