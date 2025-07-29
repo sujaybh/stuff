@@ -2,11 +2,13 @@
 """
 DOCX Embedded File Extractor
 
-This script extracts embedded files (OLE objects) from DOCX files and recursively
-processes any embedded DOCX files found within them.
+This script extracts all embedded files from DOCX documents, including:
+- Files embedded as objects within DOCX files
+- Recursive extraction from nested DOCX files
+- Extraction of attachments from embedded .msg (Outlook email) files
 
-Requirements:
-    pip install python-docx extract-msg
+Dependencies:
+    pip install python-docx extract-msg zipfile36
 
 Usage:
     python docx_extractor.py input_file.docx [output_directory]
@@ -16,255 +18,260 @@ import os
 import sys
 import zipfile
 import shutil
-from pathlib import Path
+import tempfile
 import argparse
-from typing import List, Set
+import logging
+from pathlib import Path
+from typing import List, Set, Dict, Any
 import mimetypes
-
-# Try to import required libraries
-try:
-    from docx import Document
-except ImportError:
-    print("Error: python-docx library not found. Please install it with:")
-    print("pip install python-docx")
-    sys.exit(1)
 
 try:
     import extract_msg
+    MSG_AVAILABLE = True
 except ImportError:
-    print("Error: extract-msg library not found. Please install it with:")
-    print("pip install extract-msg")
-    sys.exit(1)
+    MSG_AVAILABLE = False
+    print("Warning: extract-msg not available. .msg file processing disabled.")
 
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-class DocxEmbeddedExtractor:
-    def __init__(self, output_dir: str = "extracted_files"):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        self.file_counter = 1
+class FileExtractor:
+    def __init__(self, base_output_dir: str):
+        self.base_output_dir = Path(base_output_dir)
+        self.base_output_dir.mkdir(exist_ok=True)
+        self.file_counter = 0
         self.processed_files: Set[str] = set()
         
-    def get_file_extension(self, file_data: bytes) -> str:
-        """Detect file extension based on file signature/magic bytes"""
-        # Common file signatures
-        signatures = {
-            b'\x50\x4B\x03\x04': '.docx',  # DOCX/ZIP
-            b'\xD0\xCF\x11\xE0': '.msg',   # MSG/OLE (Outlook message files)
-            b'\xFF\xD8\xFF': '.jpg',        # JPEG
-            b'\x89\x50\x4E\x47': '.png',    # PNG
-            b'\x47\x49\x46\x38': '.gif',    # GIF
-            b'\x25\x50\x44\x46': '.pdf',    # PDF
-        }
-        
-        # Check for OLE Compound Document (could be .doc or .msg)
-        if file_data.startswith(b'\xD0\xCF\x11\xE0'):
-            # Try to determine if it's MSG by looking for MSG-specific signatures
-            if b'Microsoft Office Outlook' in file_data[:1000] or b'__substg1.0_' in file_data[:2000]:
-                return '.msg'
-            else:
-                return '.doc'
-        
-        for signature, ext in signatures.items():
-            if file_data.startswith(signature):
-                return ext
-        return '.bin'  # Unknown binary file
+    def get_next_filename(self, original_name: str, extension: str = None) -> str:
+        """Generate the next sequential filename"""
+        self.file_counter += 1
+        if extension:
+            return f"extracted_file_{self.file_counter:04d}.{extension}"
+        elif '.' in original_name:
+            ext = original_name.split('.')[-1]
+            return f"extracted_file_{self.file_counter:04d}.{ext}"
+        else:
+            return f"extracted_file_{self.file_counter:04d}"
     
-    def extract_msg_attachments(self, msg_path: str, level: int = 0) -> List[str]:
-        """Extract attachments from a .msg (Outlook email) file"""
-        msg_path = Path(msg_path)
-        
-        print(f"{'  ' * level}Processing MSG file: {msg_path.name}")
-        
-        extracted_files = []
-        
-        try:
-            # Open the MSG file using extract_msg
-            msg = extract_msg.Message(str(msg_path))
-            
-            # Get attachments
-            attachments = msg.attachments
-            
-            if not attachments:
-                print(f"{'  ' * level}No attachments found in {msg_path.name}")
-                return []
-            
-            print(f"{'  ' * level}Found {len(attachments)} attachment(s)")
-            
-            for attachment in attachments:
-                try:
-                    # Get attachment data and name
-                    attachment_data = attachment.data
-                    original_name = attachment.longFilename or attachment.shortFilename
-                    
-                    if not attachment_data:
-                        print(f"{'  ' * level}Skipping empty attachment: {original_name}")
-                        continue
-                    
-                    # Determine file extension
-                    if original_name:
-                        # Use original extension if available
-                        _, ext = os.path.splitext(original_name)
-                        if not ext:
-                            ext = self.get_file_extension(attachment_data)
-                    else:
-                        ext = self.get_file_extension(attachment_data)
-                        original_name = f"attachment_{self.file_counter}"
-                    
-                    # Create output filename
-                    output_filename = f"extracted_file_{self.file_counter:03d}{ext}"
-                    output_path = self.output_dir / output_filename
-                    
-                    # Write the extracted attachment
-                    with open(output_path, 'wb') as f:
-                        f.write(attachment_data)
-                    
-                    print(f"{'  ' * level}Extracted attachment: {output_filename} (original: {original_name})")
-                    extracted_files.append(str(output_path))
-                    self.file_counter += 1
-                    
-                    # Recursively process if it's a supported file type
-                    if ext.lower() == '.docx':
-                        print(f"{'  ' * level}Found nested DOCX in attachment, recursing...")
-                        nested_files = self.extract_embedded_files(output_path, level + 1)
-                        extracted_files.extend(nested_files)
-                    elif ext.lower() == '.msg':
-                        print(f"{'  ' * level}Found nested MSG in attachment, recursing...")
-                        nested_files = self.extract_msg_attachments(output_path, level + 1)
-                        extracted_files.extend(nested_files)
-                
-                except Exception as e:
-                    print(f"{'  ' * level}Error extracting attachment: {str(e)}")
-                    continue
-            
-            # Close the MSG file
-            msg.close()
-        
-        except Exception as e:
-            print(f"{'  ' * level}Error processing MSG file {msg_path.name}: {str(e)}")
-        
-        return extracted_files
+    def extract_embedded_files_from_docx(self, docx_path: str, current_level: int = 0) -> List[str]:
         """Extract embedded files from a DOCX file"""
-        docx_path = Path(docx_path)
-        
-        # Avoid infinite recursion by tracking processed files
-        abs_path = str(docx_path.absolute())
-        if abs_path in self.processed_files:
-            print(f"{'  ' * level}Skipping already processed file: {docx_path.name}")
-            return []
-        
-        self.processed_files.add(abs_path)
-        
-        print(f"{'  ' * level}Processing: {docx_path.name}")
-        
-        if not docx_path.exists():
-            print(f"{'  ' * level}Error: File not found - {docx_path}")
-            return []
-        
         extracted_files = []
+        indent = "  " * current_level
+        
+        logger.info(f"{indent}Processing DOCX: {docx_path}")
         
         try:
-            # Open DOCX as ZIP file to access embedded objects
-            with zipfile.ZipFile(docx_path, 'r') as zip_file:
+            # DOCX files are ZIP archives
+            with zipfile.ZipFile(docx_path, 'r') as docx_zip:
                 # Look for embedded objects in the embeddings folder
-                embedding_files = [f for f in zip_file.namelist() 
-                                 if f.startswith('word/embeddings/')]
+                embedding_files = []
                 
-                if not embedding_files:
-                    print(f"{'  ' * level}No embedded files found in {docx_path.name}")
-                    return []
+                for file_info in docx_zip.filelist:
+                    filename = file_info.filename
+                    
+                    # Check for embedded objects
+                    if filename.startswith('word/embeddings/'):
+                        embedding_files.append(filename)
+                    
+                    # Also check for media files that might be embedded objects
+                    elif (filename.startswith('word/media/') and 
+                          not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))):
+                        embedding_files.append(filename)
                 
-                print(f"{'  ' * level}Found {len(embedding_files)} embedded file(s)")
+                logger.info(f"{indent}Found {len(embedding_files)} embedded files")
                 
-                for embed_file in embedding_files:
+                # Extract each embedded file
+                for embedded_file in embedding_files:
                     try:
-                        # Extract the embedded file data
-                        file_data = zip_file.read(embed_file)
+                        # Extract the file data
+                        file_data = docx_zip.read(embedded_file)
                         
-                        # Determine file extension
-                        file_ext = self.get_file_extension(file_data)
+                        # Determine file extension from content or filename
+                        original_filename = os.path.basename(embedded_file)
                         
-                        # Create output filename
-                        output_filename = f"extracted_file_{self.file_counter:03d}{file_ext}"
-                        output_path = self.output_dir / output_filename
+                        # Try to detect file type
+                        file_extension = self.detect_file_type(file_data, original_filename)
                         
-                        # Write the extracted file
+                        # Generate new filename
+                        new_filename = self.get_next_filename(original_filename, file_extension)
+                        output_path = self.base_output_dir / new_filename
+                        
+                        # Save the file
                         with open(output_path, 'wb') as f:
                             f.write(file_data)
                         
-                        print(f"{'  ' * level}Extracted: {output_filename}")
+                        logger.info(f"{indent}Extracted: {new_filename} (original: {original_filename})")
                         extracted_files.append(str(output_path))
-                        self.file_counter += 1
                         
-                        # If the extracted file is a DOCX, recursively process it
-                        if file_ext == '.docx':
-                            print(f"{'  ' * level}Found nested DOCX, recursing...")
-                            nested_files = self.extract_embedded_files(output_path, level + 1)
+                        # Recursive processing
+                        if file_extension == 'docx':
+                            logger.info(f"{indent}Found nested DOCX, recursing...")
+                            nested_files = self.extract_embedded_files_from_docx(str(output_path), current_level + 1)
                             extracted_files.extend(nested_files)
-                        # If the extracted file is a MSG, recursively process it
-                        elif file_ext == '.msg':
-                            print(f"{'  ' * level}Found nested MSG, recursing...")
-                            nested_files = self.extract_msg_attachments(output_path, level + 1)
-                            extracted_files.extend(nested_files)
-                    
+                        
+                        elif file_extension == 'msg' and MSG_AVAILABLE:
+                            logger.info(f"{indent}Found .msg file, processing...")
+                            msg_files = self.extract_from_msg_file(str(output_path), current_level + 1)
+                            extracted_files.extend(msg_files)
+                            
                     except Exception as e:
-                        print(f"{'  ' * level}Error extracting {embed_file}: {str(e)}")
+                        logger.error(f"{indent}Error extracting {embedded_file}: {str(e)}")
                         continue
-        
-        except zipfile.BadZipFile:
-            print(f"{'  ' * level}Error: {docx_path.name} is not a valid DOCX file")
+                        
         except Exception as e:
-            print(f"{'  ' * level}Error processing {docx_path.name}: {str(e)}")
-        
+            logger.error(f"{indent}Error processing DOCX {docx_path}: {str(e)}")
+            
         return extracted_files
     
-    def process_document(self, input_file: str) -> List[str]:
-        """Main method to process a DOCX document and extract all embedded files"""
-        print(f"Starting extraction from: {input_file}")
-        print(f"Output directory: {self.output_dir.absolute()}")
-        print("-" * 50)
+    def extract_from_msg_file(self, msg_path: str, current_level: int = 0) -> List[str]:
+        """Extract attachments from a .msg (Outlook email) file"""
+        if not MSG_AVAILABLE:
+            logger.warning("extract-msg not available, skipping .msg file processing")
+            return []
+            
+        extracted_files = []
+        indent = "  " * current_level
         
-        # Determine file type and process accordingly
-        input_path = Path(input_file)
-        if input_path.suffix.lower() == '.msg':
-            extracted_files = self.extract_msg_attachments(input_file)
-        else:
-            extracted_files = self.extract_embedded_files(input_file)
+        logger.info(f"{indent}Processing MSG: {msg_path}")
         
-        print("-" * 50)
-        print(f"Extraction complete. Total files extracted: {len(extracted_files)}")
-        
-        if extracted_files:
-            print("Extracted files:")
-            for file_path in extracted_files:
-                print(f"  {file_path}")
-        
+        try:
+            # Parse the .msg file
+            msg = extract_msg.Message(msg_path)
+            
+            # Extract attachments
+            attachments = msg.attachments
+            logger.info(f"{indent}Found {len(attachments)} attachments in MSG file")
+            
+            for attachment in attachments:
+                try:
+                    # Get attachment data and filename
+                    attachment_data = attachment.data
+                    attachment_filename = attachment.longFilename or attachment.shortFilename or "unknown_attachment"
+                    
+                    # Generate new filename
+                    file_extension = self.detect_file_type(attachment_data, attachment_filename)
+                    new_filename = self.get_next_filename(attachment_filename, file_extension)
+                    output_path = self.base_output_dir / new_filename
+                    
+                    # Save the attachment
+                    with open(output_path, 'wb') as f:
+                        f.write(attachment_data)
+                    
+                    logger.info(f"{indent}Extracted attachment: {new_filename} (original: {attachment_filename})")
+                    extracted_files.append(str(output_path))
+                    
+                    # Recursive processing for DOCX attachments
+                    if file_extension == 'docx':
+                        logger.info(f"{indent}Found DOCX attachment, recursing...")
+                        nested_files = self.extract_embedded_files_from_docx(str(output_path), current_level + 1)
+                        extracted_files.extend(nested_files)
+                    
+                    # Recursive processing for MSG attachments
+                    elif file_extension == 'msg':
+                        logger.info(f"{indent}Found nested MSG attachment, recursing...")
+                        nested_msg_files = self.extract_from_msg_file(str(output_path), current_level + 1)
+                        extracted_files.extend(nested_msg_files)
+                        
+                except Exception as e:
+                    logger.error(f"{indent}Error extracting attachment: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"{indent}Error processing MSG file {msg_path}: {str(e)}")
+            
         return extracted_files
-
+    
+    def detect_file_type(self, file_data: bytes, filename: str) -> str:
+        """Detect file type from content and filename"""
+        
+        # First, try to detect from file signature (magic bytes)
+        file_signatures = {
+            b'\x50\x4B\x03\x04': 'zip',  # Generic ZIP (could be DOCX, XLSX, etc.)
+            b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1': 'msg',  # OLE/MSG files
+            b'\x50\x4B\x07\x08': 'zip',  # ZIP variant
+            b'\x50\x4B\x05\x06': 'zip',  # ZIP variant
+            b'%PDF': 'pdf',
+            b'\x89PNG': 'png',
+            b'\xFF\xD8\xFF': 'jpg',
+            b'GIF8': 'gif',
+            b'BM': 'bmp',
+        }
+        
+        # Check magic bytes
+        for signature, file_type in file_signatures.items():
+            if file_data.startswith(signature):
+                # Special handling for ZIP-based formats
+                if file_type == 'zip':
+                    if filename.lower().endswith('.docx'):
+                        return 'docx'
+                    elif filename.lower().endswith('.xlsx'):
+                        return 'xlsx'
+                    elif filename.lower().endswith('.pptx'):
+                        return 'pptx'
+                return file_type
+        
+        # Fall back to filename extension
+        if '.' in filename:
+            return filename.split('.')[-1].lower()
+        
+        # Try MIME type detection
+        mime_type, _ = mimetypes.guess_type(filename)
+        if mime_type:
+            extension_map = {
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+                'application/pdf': 'pdf',
+                'application/vnd.ms-outlook': 'msg',
+            }
+            return extension_map.get(mime_type, 'bin')
+        
+        return 'bin'  # Unknown binary file
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract embedded files from DOCX documents and MSG email files')
-    parser.add_argument('input_file', help='Input DOCX or MSG file path')
-    parser.add_argument('-o', '--output', default='extracted_files', 
+    parser = argparse.ArgumentParser(description='Extract embedded files from DOCX documents')
+    parser.add_argument('input_file', help='Input DOCX file path')
+    parser.add_argument('output_dir', nargs='?', default='extracted_files', 
                        help='Output directory (default: extracted_files)')
+    parser.add_argument('-v', '--verbose', action='store_true', 
+                       help='Enable verbose logging')
     
     args = parser.parse_args()
     
-    if not os.path.exists(args.input_file):
-        print(f"Error: Input file '{args.input_file}' not found")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Validate input file
+    input_path = Path(args.input_file)
+    if not input_path.exists():
+        logger.error(f"Input file does not exist: {input_path}")
         sys.exit(1)
     
-    input_ext = Path(args.input_file).suffix.lower()
-    if input_ext not in ['.docx', '.msg']:
-        print(f"Warning: Input file doesn't have .docx or .msg extension (found: {input_ext})")
-    
-    # Create extractor and process the document
-    extractor = DocxEmbeddedExtractor(args.output)
-    extracted_files = extractor.process_document(args.input_file)
-    
-    if not extracted_files:
-        print("No embedded files or attachments found or extracted.")
+    if not input_path.suffix.lower() == '.docx':
+        logger.error(f"Input file must be a .docx file: {input_path}")
         sys.exit(1)
-
+    
+    # Create extractor and process file
+    extractor = FileExtractor(args.output_dir)
+    
+    try:
+        logger.info(f"Starting extraction from: {input_path}")
+        extracted_files = extractor.extract_embedded_files_from_docx(str(input_path))
+        
+        logger.info(f"Extraction complete. Total files extracted: {len(extracted_files)}")
+        logger.info(f"Files saved to: {extractor.base_output_dir}")
+        
+        if extracted_files:
+            print("\nExtracted files:")
+            for i, file_path in enumerate(extracted_files, 1):
+                print(f"  {i}. {Path(file_path).name}")
+        else:
+            print("No embedded files found.")
+            
+    except Exception as e:
+        logger.error(f"Extraction failed: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
