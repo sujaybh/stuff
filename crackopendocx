@@ -42,17 +42,30 @@ class FileExtractor:
         self.base_output_dir.mkdir(exist_ok=True)
         self.file_counter = 0
         self.processed_files: Set[str] = set()
+        self.recursion_tree = []  # Store the extraction tree for display
         
     def get_next_filename(self, original_name: str, extension: str = None) -> str:
-        """Generate the next sequential filename"""
+        """Generate the next sequential filename preserving original title"""
         self.file_counter += 1
-        if extension:
-            return f"extracted_file_{self.file_counter:04d}.{extension}"
-        elif '.' in original_name:
-            ext = original_name.split('.')[-1]
-            return f"extracted_file_{self.file_counter:04d}.{ext}"
+        
+        # Clean the original name to use as title (remove path and keep base name)
+        clean_name = os.path.basename(original_name)
+        
+        # Remove extension from clean_name for the title part
+        if '.' in clean_name:
+            title_part = '.'.join(clean_name.split('.')[:-1])  # Everything except last extension
+            original_ext = clean_name.split('.')[-1]
         else:
-            return f"extracted_file_{self.file_counter:04d}"
+            title_part = clean_name
+            original_ext = extension if extension else 'bin'
+        
+        # Use provided extension if available, otherwise use original
+        final_ext = extension if extension else original_ext
+        
+        # Create filename with format: RL2-11_NNN_<original_title>.<ext>
+        new_filename = f"RL2-11_{self.file_counter:03d}_{title_part}.{final_ext}"
+        
+        return new_filename
     
     def extract_embedded_files_from_docx(self, docx_path: str, current_level: int = 0) -> List[str]:
         """Extract embedded files from a DOCX file"""
@@ -76,7 +89,7 @@ class FileExtractor:
                     
                     # Also check for media files that might be embedded objects
                     elif (filename.startswith('word/media/') and 
-                          not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))):
+                          not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.emf'))):
                         embedding_files.append(filename)
                 
                 logger.info(f"{indent}Found {len(embedding_files)} embedded files")
@@ -93,6 +106,11 @@ class FileExtractor:
                         # Try to detect file type
                         file_extension = self.detect_file_type(file_data, original_filename)
                         
+                        # Skip if it's an image file we don't want to process
+                        if file_extension is None:
+                            logger.info(f"{indent}Skipping image file: {original_filename}")
+                            continue
+                        
                         # Generate new filename
                         new_filename = self.get_next_filename(original_filename, file_extension)
                         output_path = self.base_output_dir / new_filename
@@ -103,6 +121,10 @@ class FileExtractor:
                         
                         logger.info(f"{indent}Extracted: {new_filename} (original: {original_filename})")
                         extracted_files.append(str(output_path))
+                        
+                        # Add to recursion tree
+                        tree_prefix = ">" * current_level
+                        self.recursion_tree.append(f"{tree_prefix}{new_filename}")
                         
                         # Recursive processing
                         if file_extension == 'docx':
@@ -151,6 +173,11 @@ class FileExtractor:
                     
                     # Generate new filename
                     file_extension = self.detect_file_type(attachment_data, attachment_filename)
+                    
+                    # Skip if it's an image file we don't want to process
+                    if file_extension is None:
+                        logger.info(f"{indent}Skipping image attachment: {attachment_filename}")
+                        continue
                     new_filename = self.get_next_filename(attachment_filename, file_extension)
                     output_path = self.base_output_dir / new_filename
                     
@@ -160,6 +187,10 @@ class FileExtractor:
                     
                     logger.info(f"{indent}Extracted attachment: {new_filename} (original: {attachment_filename})")
                     extracted_files.append(str(output_path))
+                    
+                    # Add to recursion tree
+                    tree_prefix = ">" * current_level
+                    self.recursion_tree.append(f"{tree_prefix}{new_filename}")
                     
                     # Recursive processing for DOCX attachments
                     if file_extension == 'docx':
@@ -185,17 +216,14 @@ class FileExtractor:
     def detect_file_type(self, file_data: bytes, filename: str) -> str:
         """Detect file type from content and filename"""
         
-        # First, try to detect from file signature (magic bytes)
+        # File signatures for detection (excluding image files we don't want)
         file_signatures = {
             b'\x50\x4B\x03\x04': 'zip',  # Generic ZIP (could be DOCX, XLSX, etc.)
             b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1': 'msg',  # OLE/MSG files
             b'\x50\x4B\x07\x08': 'zip',  # ZIP variant
             b'\x50\x4B\x05\x06': 'zip',  # ZIP variant
             b'%PDF': 'pdf',
-            b'\x89PNG': 'png',
-            b'\xFF\xD8\xFF': 'jpg',
-            b'GIF8': 'gif',
-            b'BM': 'bmp',
+            # Note: Removed image formats as we're ignoring them
         }
         
         # Check magic bytes
@@ -211,9 +239,18 @@ class FileExtractor:
                         return 'pptx'
                 return file_type
         
+        # Check if it's an image file we want to ignore
+        image_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.emf', '.wmf', '.tiff', '.tif']
+        if any(filename.lower().endswith(ext) for ext in image_extensions):
+            return None  # Signal to ignore this file
+        
         # Fall back to filename extension
         if '.' in filename:
-            return filename.split('.')[-1].lower()
+            ext = filename.split('.')[-1].lower()
+            # Don't process image files
+            if f'.{ext}' in image_extensions:
+                return None
+            return ext
         
         # Try MIME type detection
         mime_type, _ = mimetypes.guess_type(filename)
@@ -266,6 +303,13 @@ def main():
             print("\nExtracted files:")
             for i, file_path in enumerate(extracted_files, 1):
                 print(f"  {i}. {Path(file_path).name}")
+                
+            print("\nRecursion Tree:")
+            if extractor.recursion_tree:
+                for tree_entry in extractor.recursion_tree:
+                    print(tree_entry)
+            else:
+                print("No files extracted (no recursion tree to display)")
         else:
             print("No embedded files found.")
             
