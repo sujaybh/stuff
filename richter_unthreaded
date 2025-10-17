@@ -1,0 +1,473 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from dataclasses import dataclass
+from typing import List, Tuple
+import time
+
+
+@dataclass
+class Fragment:
+    """Represents a spherical fragment (protostar)"""
+    x: float
+    y: float
+    z: float
+    radius: float
+    mass: float
+
+
+class IMFSimulation:
+    """
+    Simulates the Initial Mass Function using domain packing principles.
+    Based on Richtler (1994) A&A 287, 517-522
+    """
+
+    def __init__(self, r_min: float = 0.027, r_max: float = 0.21, master_radius: float = 1.0):
+        """
+        Initialize simulation parameters.
+
+        Args:
+            r_min: Minimum fragment radius (default 0.027 ~ 0.1 M_sun)
+            r_max: Maximum fragment radius (default 0.21 ~ 46 M_sun)
+            master_radius: Radius of master sphere (normalized to 1.0)
+        """
+        self.r_min = r_min
+        self.r_max = r_max
+        self.master_radius = master_radius
+
+        # Normalize to unit volume for simplicity (as in paper)
+        self.master_volume = 1.0
+
+    def random_position_in_sphere(self) -> Tuple[float, float, float]:
+        """Generate random position inside master sphere using rejection sampling."""
+        while True:
+            # Generate uniform random coordinates in the bounding cube
+            x = np.random.uniform(-self.master_radius, self.master_radius)
+            y = np.random.uniform(-self.master_radius, self.master_radius)
+            z = np.random.uniform(-self.master_radius, self.master_radius)
+
+            # Check if position is inside the sphere
+            if x ** 2 + y ** 2 + z ** 2 <= self.master_radius ** 2:
+                return x, y, z
+
+    def distance_to_boundary(self, x: float, y: float, z: float) -> float:
+        """Calculate distance from point to master sphere boundary."""
+        r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
+        # Assuming the master sphere is centered at (0, 0, 0)
+        return self.master_radius - r
+
+    def distance_between_points(self, x1: float, y1: float, z1: float,
+                                x2: float, y2: float, z2: float) -> float:
+        """Calculate Euclidean distance between two points."""
+        return np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2 + (z1 - z2) ** 2)
+
+    def calculate_available_radius(self, x: float, y: float, z: float,
+                                   fragments: List[Fragment]) -> float:
+        """
+        Calculate maximum radius available at position (x,y,z) without overlapping.
+
+        Returns the minimum of:
+        - Distance to master sphere boundary
+        - Distance to all existing fragments (minus their radii)
+        - r_max (the absolute maximum)
+        """
+        # Start with distance to boundary
+        r_available = self.distance_to_boundary(x, y, z)
+
+        # Check distance to all existing fragments
+        for frag in fragments:
+            d = self.distance_between_points(x, y, z, frag.x, frag.y, frag.z)
+            # Available space is distance center-to-center minus the existing fragment's radius
+            available_near_frag = d - frag.radius
+            r_available = min(r_available, available_near_frag)
+
+        # Cannot exceed master maximum
+        r_available = min(r_available, self.r_max)
+
+        # Ensure radius is not negative due to floating point or proximity errors
+        return max(0.0, r_available)
+
+    def run_single_simulation(self, target_filling_factor: float,
+                              max_attempts: int = 10000,
+                              radius_distribution: str = 'uniform') -> List[Fragment]:
+        """
+        Run a single simulation filling the master volume.
+        """
+        fragments = []
+        current_filling_factor = 0.0
+        consecutive_failures = 0
+
+        print(f"  Starting run with target filling factor: {target_filling_factor:.2f}")
+
+        while current_filling_factor < target_filling_factor:
+            # 1. Generate random candidate position
+            x, y, z = self.random_position_in_sphere()
+
+            # 2. Calculate available radius at this position
+            r_available = self.calculate_available_radius(x, y, z, fragments)
+
+            # 3. Check if a fragment can fit
+            if r_available < self.r_min:
+                consecutive_failures += 1
+                if consecutive_failures > max_attempts:
+                    print(f"  Reached max attempts. Stopping at filling factor: {current_filling_factor:.3f}")
+                    break
+                continue
+
+            # Reset failure counter on success
+            consecutive_failures = 0
+
+            # 4. Select fragment radius based on distribution
+            if radius_distribution == 'uniform':
+                # Uniform distribution of R (dN/dR = const)
+                radius = np.random.uniform(self.r_min, r_available)
+            elif radius_distribution == 'log_uniform':
+                # Uniform in log space of R
+                log_r_min = np.log10(self.r_min)
+                log_r_available = np.log10(r_available)
+                radius = 10 ** np.random.uniform(log_r_min, log_r_available)
+            elif radius_distribution == 'gaussian':
+                # Gaussian centered at characteristic radius
+                char_radius = 0.1
+                sigma = 0.1
+                radius = np.random.normal(char_radius, sigma)
+                # Clip to valid range
+                radius = np.clip(radius, self.r_min, r_available)
+            else:
+                raise ValueError(f"Unknown distribution: {radius_distribution}")
+
+            # 5. Calculate mass (proportional to volume, R^3)
+            mass = radius ** 3
+
+            # 6. Create and store fragment
+            fragment = Fragment(x, y, z, radius, mass)
+            fragments.append(fragment)
+
+            # 7. Update filling factor
+            current_filling_factor += mass
+
+            # Progress update
+            if len(fragments) % 1000 == 0:
+                print(f"  Fragments: {len(fragments)}, Filling factor: {current_filling_factor:.3f}")
+
+        print(f"  Completed: {len(fragments)} fragments, filling factor: {current_filling_factor:.3f}")
+        return fragments
+
+    def calculate_mass_function_slope(self, masses: np.ndarray,
+                                      mass_min: float, mass_max: float) -> Tuple[float, float]:
+        """
+        Calculate power law exponent (alpha) for mass function in given range.
+
+        dN/dm ~ m^alpha
+        In log space: log(dN/dm) = alpha * log(m) + const
+        """
+        # Filter masses in range
+        mask = (masses >= mass_min) & (masses <= mass_max)
+        masses_in_range = masses[mask]
+
+        if len(masses_in_range) < 10:  # Increased minimum count for better fit
+            return np.nan, np.nan
+
+        # Create logarithmic bins
+        n_bins = 20
+        # Use logspace for bin edges to make bins equal in log space
+        log_bins = np.logspace(np.log10(mass_min), np.log10(mass_max), n_bins + 1)
+
+        # Histogram: counts in each bin
+        counts, bin_edges = np.histogram(masses_in_range, bins=log_bins)
+
+        # Calculate bin centers and widths
+        bin_centers = np.sqrt(bin_edges[1:] * bin_edges[:-1])  # Geometric mean for log bins
+        bin_widths = bin_edges[1:] - bin_edges[:-1]
+
+        # Calculate dN/dm (number per unit mass)
+        # counts / (mass interval)
+        dN_dm = counts / bin_widths
+
+        # Prepare for linear fit in log space
+        nonzero = dN_dm > 0
+        if np.sum(nonzero) < 3:
+            return np.nan, np.nan
+
+        log_mass = np.log10(bin_centers[nonzero])
+        log_dN_dm = np.log10(dN_dm[nonzero])
+
+        # Linear fit: y = slope * x + intercept
+        # log(dN/dm) = alpha * log(m) + const
+        slope, intercept, r_value, p_value, std_err = stats.linregress(log_mass, log_dN_dm)
+
+        # The slope is the power law exponent alpha
+        return slope, std_err
+
+    def run_multiple_simulations(self, target_filling_factor: float,
+                                 n_runs: int = 10,
+                                 radius_distribution: str = 'uniform') -> dict:
+        """
+        Run multiple simulations and collect statistics.
+        """
+        print(f"\nRunning {n_runs} simulations with filling factor {target_filling_factor:.2f}")
+        print("=" * 70)
+
+        all_masses = []
+        alphas_high = []
+        alphas_intermediate = []
+        alphas_low = []
+        alphas_brown_dwarf = []
+
+        # Normalized mass ranges
+        mass_ranges = {
+            'high': (0.0008, 0.008),  # Large mass fragments
+            'intermediate': (0.00016, 0.0016),
+            'low': (0.00002, 0.0002),  # Small mass fragments
+            'brown_dwarf': (0.000002, 0.00002)  # Very small mass fragments
+        }
+
+        for run in range(n_runs):
+            print(f"\nRun {run + 1}/{n_runs}")
+            fragments = self.run_single_simulation(target_filling_factor,
+                                                   radius_distribution=radius_distribution)
+
+            masses = np.array([f.mass for f in fragments])
+            all_masses.append(masses)
+
+            # Calculate alpha for each mass range
+            alpha_h, _ = self.calculate_mass_function_slope(masses, *mass_ranges['high'])
+            alpha_i, _ = self.calculate_mass_function_slope(masses, *mass_ranges['intermediate'])
+            alpha_l, _ = self.calculate_mass_function_slope(masses, *mass_ranges['low'])
+            alpha_bd, _ = self.calculate_mass_function_slope(masses, *mass_ranges['brown_dwarf'])
+
+            # Store non-NaN results
+            if not np.isnan(alpha_h):
+                alphas_high.append(alpha_h)
+            if not np.isnan(alpha_i):
+                alphas_intermediate.append(alpha_i)
+            if not np.isnan(alpha_l):
+                alphas_low.append(alpha_l)
+            if not np.isnan(alpha_bd):
+                alphas_brown_dwarf.append(alpha_bd)
+
+        # Compile results
+        results = {
+            'filling_factor': target_filling_factor,
+            'n_runs': n_runs,
+            'all_masses': all_masses,
+            'mass_ranges': mass_ranges,
+            'alphas': {
+                'high': {'values': alphas_high, 'mean': np.nan if not alphas_high else np.mean(alphas_high),
+                         'std': np.nan if not alphas_high else np.std(alphas_high)},
+                'intermediate': {'values': alphas_intermediate,
+                                 'mean': np.nan if not alphas_intermediate else np.mean(alphas_intermediate),
+                                 'std': np.nan if not alphas_intermediate else np.std(alphas_intermediate)},
+                'low': {'values': alphas_low, 'mean': np.nan if not alphas_low else np.mean(alphas_low),
+                        'std': np.nan if not alphas_low else np.std(alphas_low)},
+                'brown_dwarf': {'values': alphas_brown_dwarf,
+                                'mean': np.nan if not alphas_brown_dwarf else np.mean(alphas_brown_dwarf),
+                                'std': np.nan if not alphas_brown_dwarf else np.std(alphas_brown_dwarf)}
+            }
+        }
+
+        # Print summary
+        print("\n" + "=" * 70)
+        print("RESULTS SUMMARY")
+        print("=" * 70)
+        for regime in ['high', 'intermediate', 'low', 'brown_dwarf']:
+            alpha_data = results['alphas'][regime]
+            print(f"{regime:15s}: α = {alpha_data['mean']:6.3f} ± {alpha_data['std']:6.3f} "
+                  f"(n={len(alpha_data['values'])})")
+
+        return results
+
+
+def plot_alpha_vs_filling_factor(results_list: List[dict], save_path: str = None):
+    """
+    Replicate Figure 1 from Richtler (1994).
+    Plot alpha vs filling factor for different mass ranges.
+    """
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # Extract data for each mass range
+    regimes = ['intermediate', 'low']
+    colors = {'intermediate': 'blue', 'low': 'red'}
+    markers = {'intermediate': 'o', 'low': '^'}
+    labels = {
+        'intermediate': r'$0.8-8\, M_{\odot}$ (0.00016-0.0016)',
+        'low': r'$0.1-1.0\, M_{\odot}$ (0.00002-0.0002)'
+    }
+
+    for regime in regimes:
+        filling_factors = []
+        mean_alphas = []
+        std_alphas = []
+
+        for result in results_list:
+            mean_alpha = result['alphas'][regime]['mean']
+            if not np.isnan(mean_alpha):
+                filling_factors.append(result['filling_factor'])
+                mean_alphas.append(mean_alpha)
+                std_alphas.append(result['alphas'][regime]['std'])
+
+        ax.errorbar(filling_factors, mean_alphas, yerr=std_alphas,
+                    marker=markers[regime], color=colors[regime],
+                    linestyle='-', linewidth=2, markersize=8,
+                    label=labels[regime], capsize=5)
+
+    # Salpeter reference line (Original Salpeter: x^-2.35 -> dN/dlogM ~ M^-1.35. Here: dN/dm ~ m^alpha)
+    # The exponent for dN/dm is alpha = -(x+1) where x is the slope of M^-x in dN/dlogM (usually x=1.35)
+    # Salpeter dN/dlogM ~ M^-1.35, implies dN/dm ~ m^-2.35.
+    salpeter_alpha = -2.35
+    ax.axhline(y=salpeter_alpha, color='green', linestyle='--', linewidth=2,
+               label=f'Salpeter value ({salpeter_alpha})', alpha=0.7)
+
+    ax.set_xlabel('Filling Factor', fontsize=14)
+    ax.set_ylabel(r'Power Law Exponent $\alpha$', fontsize=14)
+    ax.set_title('IMF Power Law Exponent vs Filling Factor\n(Replicating Richtler 1994, Figure 1)',
+                 fontsize=15, fontweight='bold')
+    ax.legend(fontsize=11, loc='lower left')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0.15, 0.75)  # Adjust limits to better show data range
+    ax.set_ylim(-3.0, -0.5)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def plot_mass_distribution(results: dict, save_path: str = None):
+    """
+    Replicate Figure 2 from Richtler (1994).
+    Plot the full mass distribution showing flattening at extremes.
+    """
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # Combine all masses from all runs
+    # np.concatenate is the non-deprecated way to combine arrays
+    all_masses = np.concatenate(results['all_masses'])
+
+    # Filter out masses that are too small/large for reasonable log scale
+    all_masses = all_masses[all_masses > 1e-7]
+
+    # Create logarithmic bins
+    log_mass_min = np.log10(np.min(all_masses))
+    log_mass_max = np.log10(np.max(all_masses))
+    n_bins = 50
+    log_bins = np.logspace(log_mass_min, log_mass_max, n_bins)
+
+    # Histogram: Counts per log(Mass) bin
+    counts, bin_edges = np.histogram(all_masses, bins=log_bins)
+    bin_centers = np.sqrt(bin_edges[1:] * bin_edges[:-1])  # Geometric mean
+
+    # Prepare for log-log plot
+    nonzero = counts > 0
+    log_mass = np.log10(bin_centers[nonzero])
+    log_counts = np.log10(counts[nonzero])
+
+    # Plot histogram points
+    ax.plot(log_mass, log_counts, 'o', markersize=4,
+            color='darkblue', label='Mass Distribution')
+
+    # Plot connecting line for visibility
+    ax.plot(log_mass, log_counts, '-', linewidth=1,
+            color='darkblue', alpha=0.5)
+
+    # Fit and plot lines for different regimes
+    mass_ranges = results['mass_ranges']
+    colors_fit = {'high': 'red', 'intermediate': 'green', 'low': 'orange', 'brown_dwarf': 'purple'}
+
+    for regime, (m_min, m_max) in mass_ranges.items():
+        alpha_mean = results['alphas'][regime]['mean']
+        if not np.isnan(alpha_mean):
+
+            # Create log mass range for the fit line
+            log_m_fit = np.linspace(np.log10(m_min), np.log10(m_max), 50)
+
+            # Calculate a point (center of the log mass range) for normalization
+            # to anchor the fit line to the actual histogram data
+            log_m_center = (np.log10(m_min) + np.log10(m_max)) / 2
+
+            # Interpolate the log_counts at the center mass for normalization
+            if np.min(log_mass) <= log_m_center <= np.max(log_mass):
+                log_c_center = np.interp(log_m_center, log_mass, log_counts)
+            else:
+                # If center is outside the plotted range, use edge points or skip
+                continue
+
+                # Calculate the log_counts for the linear fit: log(N) = const + alpha * log(m)
+            # const = log_c_center - alpha * log_m_center
+            # log(N)_fit = (log_c_center - alpha * log_m_center) + alpha * log(m)_fit
+            # log(N)_fit = log_c_center + alpha * (log(m)_fit - log_m_center)
+            log_c_fit = log_c_center + alpha_mean * (log_m_fit - log_m_center)
+
+            ax.plot(log_m_fit, log_c_fit, '--', linewidth=2,
+                    color=colors_fit[regime],
+                    label=f'{regime}: ' + r'$\alpha$' + f'={alpha_mean:.2f}')
+
+    ax.set_xlabel(r'log$_{10}$(Mass)', fontsize=14)
+    ax.set_ylabel(r'log$_{10}$(Number of Fragments)', fontsize=14)
+    ax.set_title(f'Mass Distribution (Filling Factor = {results["filling_factor"]:.2f})\n' +
+                 'Replicating Richtler 1994, Figure 2',
+                 fontsize=15, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def main():
+    """
+    Main execution: Run full parameter sweep and create all plots.
+    """
+    print("=" * 70)
+    print("IMF DOMAIN PACKING SIMULATION")
+    print("Based on Richtler (1994) A&A 287, 517-522")
+    print("=" * 70)
+
+    # Initialize simulation
+    sim = IMFSimulation(r_min=0.027, r_max=0.21)
+
+    # Define filling factors for Figure 1 sweep
+    # Reduced the number of runs to speed up execution for a standard environment
+    filling_factors = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    n_runs_fig1 = 5  # Reduced from 10
+
+    results_list = []
+    start_time = time.time()
+
+    for ff in filling_factors:
+        results = sim.run_multiple_simulations(ff, n_runs=n_runs_fig1)
+        results_list.append(results)
+
+    # Create Figure 1: Alpha vs Filling Factor
+    print("\n" + "=" * 70)
+    print("Creating Figure 1: α vs Filling Factor")
+    print("=" * 70)
+    plot_alpha_vs_filling_factor(results_list, save_path='figure1_alpha_vs_ff.png')
+
+    # Create Figure 2: Full mass distribution at moderate filling factor
+    print("\n" + "=" * 70)
+    print("Creating Figure 2: Mass Distribution (High Stats Run)")
+    print("=" * 70)
+
+    # Run with higher statistics for better Figure 2 plot
+    results_fig2 = sim.run_multiple_simulations(0.5, n_runs=10)
+    plot_mass_distribution(results_fig2, save_path='figure2_mass_distribution.png')
+
+    end_time = time.time()
+
+    print("\n" + "=" * 70)
+    print(f"SIMULATION COMPLETE! Total time: {end_time - start_time:.2f} seconds.")
+    print("=" * 70)
+    print("Key findings (based on Richtler 1994):")
+    print(
+        f"1. α for intermediate/low mass regimes should approach Salpeter value ({IMFSimulation.calculate_mass_function_slope.__defaults__[0] if IMFSimulation.calculate_mass_function_slope.__defaults__ else '-2.35'} if available) as filling factor increases.")
+    print("2. The mass function should flatten (α becomes less negative) at very low masses (brown dwarfs).")
+    print("\nFigures saved as:")
+    print("  - figure1_alpha_vs_ff.png")
+    print("  - figure2_mass_distribution.png")
+
+
+if __name__ == "__main__":
+    main()
